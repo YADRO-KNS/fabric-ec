@@ -53,6 +53,7 @@ enum {
 	GET_TIMEOUT_ID,
 	SET_TIMEOUT_ID,
 	FLTR_HDR_ID,
+	EC_USB_RESET_ID,
 	MAX_LIMIT_EC_GROUP
 };
 
@@ -60,6 +61,7 @@ enum {
 #define EC_SERV_TIMEOUT_GET	_IOR(EC_USB_MINOR, GET_TIMEOUT_ID, int*)
 #define EC_SERV_TIMEOUT_SET	_IOWR(EC_USB_MINOR, SET_TIMEOUT_ID, int)
 #define EC_HBP_CAN_FLTR_SET	_IOWR(EC_USB_MINOR, FLTR_HDR_ID, u32)
+#define EC_USB_RESET		_IOWR(EC_USB_MINOR, EC_USB_RESET_ID, int)
 
 /* Macro for system events */
 #define SND_MSG_EVENT(c, event)	set_bit((int)event, (void*)&c->flags)
@@ -282,7 +284,6 @@ struct ec_usb_ep {
  *
  * @usb_dev:     usb device data
  * @interface:   the interface for this device
- * @dev_attr:    attr for sysfs file of ec dev
  * @kref:        reference counter
  * @ep_bulk_in:  data structure of the bulk-in usb endpoint
  * @ep_bulk_out: data structure of the bulk-out usb endpoint
@@ -295,7 +296,6 @@ struct ec_usb_ep {
 struct ec_dev {
 	struct usb_device *usb_dev;
 	struct usb_interface *interface;
-	struct device_attribute dev_attr;
 	struct kref kref;
 	struct completion hold;
 	struct ec_usb_ep ep_bulk_in;
@@ -342,7 +342,7 @@ static struct usb_driver ec_usb_driver;
  *
  * Returns true if the circular buffer is empty.
  */
-static bool ring_buff_is_empty(ring_pckt_buff_t *ring_buff )
+static bool ring_buff_is_empty(ring_pckt_buff_t *ring_buff)
 {
 	return ring_buff->tail == ring_buff->head;
 }
@@ -354,7 +354,7 @@ static bool ring_buff_is_empty(ring_pckt_buff_t *ring_buff )
  *
  * Returns true if the circular buffer is full
  */
-static bool ring_buff_is_full(ring_pckt_buff_t* ring_buff )
+static bool ring_buff_is_full(ring_pckt_buff_t* ring_buff)
 {
 	if (!CIRC_SPACE(ring_buff->head, ring_buff->tail, CIRCULAR_NUM_ENTRY))
 		return true;
@@ -466,7 +466,7 @@ static int ring_buff_read_packet(ring_pckt_buff_t *ring_buff,
  */
 static int ring_buff_user_read_packet(ring_pckt_buff_t *ring_buff,
 				      void __user *read_to_user,
-				      u8 *count )
+				      u8 *count)
 {
 	int rv = 0;
 	if (ring_buff_is_empty(ring_buff)) {
@@ -622,7 +622,7 @@ static int cou_packet_rcv_process(void *arg)
 				  ec->ep_bulk_in.buff_size,
 				  &size,
 				  timeout);
-		switch( rv ) {
+		switch(rv) {
 		case 0:
 			if ((size > COU_PACKET_SIZE) ||
 			    (size < COU_ATTR_HEADER_SIZE)) {
@@ -674,7 +674,7 @@ static int cou_packet_rcv_process(void *arg)
 			EC_ERR("unknown status received: rv = %d\n", rv);
 			break;
 
-		} /* end switch( rv ) */
+		} /* end switch(rv) */
 
 	} /* end while( !kthread_should_stop() ... */
 
@@ -1043,6 +1043,29 @@ static int hbp_filter_wait_packet_timeout(struct process_context *self,
 }
 
 /**
+ * ec_usb_hot_reset() - Use this function to reset the USB interface
+ *                      from the host to the microcontroller
+ *
+ * @ec: ec control structure
+ */
+static int ec_usb_hot_reset(struct ec_dev *ec)
+{
+	struct usb_interface *ec_usb_iface = ec->interface;
+	EC_INFO("Reset USB interface to the controller! ...\n");
+
+	/*
+	 * Reset EC USB device from an atomic context
+	 * where usb_reset_device won't work (as it blocks).
+	 * There is no no need to lock/unlock the reset_ws as
+	 * schedule_work does its own.
+	 */
+	usb_queue_reset_device(ec_usb_iface);
+
+	EC_INFO("...Done!\n");
+	return 0;
+}
+
+/**
  * ec_delete()
  */
 static void ec_delete(struct kref *kref)
@@ -1050,8 +1073,8 @@ static void ec_delete(struct kref *kref)
 	struct ec_dev *ec  = TO_EC_DEV(kref);
 
 	EC_INFO("Delete device from devfs table!...");
-	if (!ec->ep_bulk_out.desc) {
-		if (!ec->ep_bulk_out.buff) {
+	if (ec->ep_bulk_out.desc) {
+		if (ec->ep_bulk_out.buff) {
 			/* free up allocated buffer */
 			usb_free_coherent(ec->usb_dev,
 					  ec->ep_bulk_out.buff_size,
@@ -1062,9 +1085,11 @@ static void ec_delete(struct kref *kref)
 		ec->ep_bulk_out.desc = NULL;
 	}
 
-	if (!ec->ep_int_in.desc) {
+	ec->ep_bulk_in.desc = NULL;
+
+	if (ec->ep_int_in.desc) {
 		/* deactivate dma buffer */
-		if (!ec->ep_int_in.buff) {
+		if (ec->ep_int_in.buff) {
 			usb_free_coherent(ec->usb_dev,
 					  ec->ep_int_in.buff_size,
 					  ec->ep_int_in.buff,
@@ -1312,7 +1337,7 @@ static int ec_msg_fasync(int fd, struct file *file, int mode)
 
 	/* TODO: need to add a check: the device is disconnected */
 	/* create asynchronous event queue */
-	EC_INFO( "Call ec_msg_fasync: pid = %d\n", current->pid );
+	EC_INFO("Call ec_msg_fasync: pid = %d\n", current->pid);
 	return fasync_helper(fd, file, mode, &ec->async_event);
 }
 
@@ -1362,7 +1387,7 @@ static long ec_cmd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		rv = copy_from_user(&cmd_packet,
 				    (void __user*)arg,
 				    COU_PACKET_SIZE);
-		if ( rv ) {
+		if (rv) {
 			/* error occurred while copying from user space */
 			EC_ERR("Error with copying data from"
 			       "user space! rv = %d\n",
@@ -1400,6 +1425,10 @@ static long ec_cmd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				return -EFAULT;
 			}
 		}
+		break;
+
+	case EC_USB_RESET:
+		ec_usb_hot_reset(ec);
 		break;
 
 	default:
@@ -1463,17 +1492,17 @@ static void ec_usb_interrupt_ep_handler(struct urb *urb)
 	rv = usb_submit_urb(urb, GFP_ATOMIC);
 	if (rv) {
 		/* error with transmiting URB */
-		EC_ERR( "usb_submit_urb failed: %d\n", rv );
+		EC_ERR("usb_submit_urb failed: %d\n", rv);
 	}
 	EC_INFO(": ec_usb_interrupt_ep_handler(): exit!\n");
 }
 
 /**
- * ec_statistics_show()
+ * ec_sysfs_statistics_show()
  */
-static ssize_t ec_statistics_show(struct device *dev,
-				  struct device_attribute *attr,
-				  char *buf)
+static ssize_t ec_sysfs_statistics_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
 {
 	struct usb_interface *interface = to_usb_interface(dev);
 	struct ec_dev *ec;
@@ -1486,12 +1515,12 @@ static ssize_t ec_statistics_show(struct device *dev,
 }
 
 /**
- * ec_statistics_reset()
+ * ec_sysfs_statistics_reset()
  */
-static ssize_t ec_statistics_reset(struct device* dev,
-				   struct device_attribute* attr,
-				   const char* buf,
-				   size_t count)
+static ssize_t ec_sysfs_statistics_reset(struct device* dev,
+					 struct device_attribute* attr,
+					 const char* buf,
+					 size_t count)
 {
 	struct usb_interface *interface = to_usb_interface(dev);
 	struct ec_dev *ec;
@@ -1503,6 +1532,71 @@ static ssize_t ec_statistics_reset(struct device* dev,
 	cou_stat_reset(&ec->cou);
 	return count;
 }
+
+/*
+ * ec_sysfs_statistics
+ */
+static struct device_attribute ec_sysfs_statistics = {
+	.attr.name = "statistic",
+	.attr.mode = S_IRUGO | S_IWUSR,
+	.show = ec_sysfs_statistics_show,
+	.store = ec_sysfs_statistics_reset,
+};
+
+/**
+ * ec_sysfs_usb_hot_reset() - reset the ec device by writing
+ *                            "1" value to the "hreset" file
+ *                            in the sysfs
+ * Returns:
+ * count   - success;
+ * -ENODEV - dev isn`t found;
+ */
+static ssize_t ec_sysfs_usb_hot_reset(struct device* dev,
+				      struct device_attribute* attr,
+				      const char* buf,
+				      size_t count)
+{
+	struct usb_interface *interface = to_usb_interface(dev);
+	int rv = -ENODEV;
+	struct ec_dev *ec;
+
+	if (!interface)
+		return rv;
+
+	dev_info(dev, "Hot reset!\n");
+	ec = (struct ec_dev *)usb_get_intfdata(interface);
+
+	/* reset device */
+	ec_usb_hot_reset(ec);
+
+	return count;
+}
+
+/**
+ * ec_sysfs_hot_reset
+ */
+static struct device_attribute ec_sysfs_hot_reset = {
+	.attr.name = "hreset",
+	.attr.mode = S_IWUSR,
+	.show = NULL,
+	.store = ec_sysfs_usb_hot_reset,
+};
+
+/**
+ * ec_sysfs_dev_attrs[]
+ */
+static struct attribute *ec_sysfs_dev_attrs[] = {
+	&ec_sysfs_statistics.attr,
+	&ec_sysfs_hot_reset.attr,
+	NULL
+};
+
+/**
+ * ec_sysfs_dev_attr_grp
+ */
+static const struct attribute_group ec_sysfs_dev_attr_grp = {
+	.attrs = ec_sysfs_dev_attrs,
+};
 
 /**
  * print_ep_info()
@@ -1638,7 +1732,7 @@ static int ec_probe(struct usb_interface *interface,
 		iface_desc = interface->cur_altsetting;
 		dev_info(&interface->dev,
 			 "device have %d endpoints\n",
-			 iface_desc->desc.bNumEndpoints );
+			 iface_desc->desc.bNumEndpoints);
 
 		for(i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
 			/* get information about endpoint */
@@ -1745,7 +1839,7 @@ static int ec_probe(struct usb_interface *interface,
 
 		/* transmit interrupt-in urb to usb stack */
 		rv = usb_submit_urb(ec->ep_int_in.urb, GFP_KERNEL);
-		if ( rv ) {
+		if (rv) {
 			/* error with transfer */
 			rv = -EIO;
 			dev_err(&interface->dev,
@@ -1754,16 +1848,11 @@ static int ec_probe(struct usb_interface *interface,
 			break;
 		}
 
-		/* set new attr for reading statistic */
-		ec->dev_attr.attr.name = "statistic";
-		ec->dev_attr.attr.mode = S_IRUGO | S_IWUSR;
-		ec->dev_attr.show = ec_statistics_show;
-		ec->dev_attr.store = ec_statistics_reset;
-		/* create device attribute files */
-		rv = device_create_file(&interface->dev, &ec->dev_attr);
-		if ( rv ) {
+		/* create device attribute files in sysfs */
+		rv = sysfs_create_group(&interface->dev.kobj, &ec_sysfs_dev_attr_grp);
+		if (rv) {
 			dev_err(&interface->dev,
-				"Failed to create the device file in"
+				"Failed to create the device files in"
 				"the sysfs! rv = %d \n",
 				rv);
 			break;
@@ -1786,9 +1875,11 @@ static void ec_disconnect(struct usb_interface *interface)
 	int ec_minor = interface->minor;
 
 	dev_info(&interface->dev, "ec_disconnect!\n");
-	/* remove device file from sysfs */
 	ec = (struct ec_dev*) usb_get_intfdata(interface);
-	device_remove_file(&interface->dev, &ec->dev_attr);
+
+	/* remove device file from sysfs */
+	sysfs_remove_group(&interface->dev.kobj, &ec_sysfs_dev_attr_grp);
+
 	/* stop all threads */
 	if (ec->cou.pckt_proc) kthread_stop(ec->cou.pckt_proc);
 	if (ec->cou.stat_proc) kthread_stop(ec->cou.stat_proc);
